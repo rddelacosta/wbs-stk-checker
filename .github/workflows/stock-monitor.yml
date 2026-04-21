@@ -3,7 +3,7 @@ name: Shopify Stock Monitor
 on:
   schedule:
     - cron: '*/5 * * * *'
-  workflow_dispatch: # "Run workflow" button for instant testing
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -44,20 +44,21 @@ jobs:
           }
 
           # --- Product check ---
+          # FIX: This store omits `available` from variant JSON.
+          # For a single-unit used listing: HTTP 200 + valid product JSON = in stock.
+          # HTTP 404 = sold/unpublished. Do NOT rely on variants[].available.
           prod_tmp=$(mktemp)
           prod_status=$(fetch "$PRODUCT_URL" "$prod_tmp")
           product_available=$prev_product
 
-          if [ "$prod_status" = "200" ] && jq -e '.' "$prod_tmp" >/dev/null 2>&1; then
-            if jq -e '[.product.variants[]? | select(.available == true)] | length > 0' "$prod_tmp" >/dev/null 2>&1; then
-              product_available=true
-            else
-              product_available=false
-            fi
+          if [ "$prod_status" = "200" ] && jq -e '.product.id' "$prod_tmp" >/dev/null 2>&1; then
+            product_available=true
+            echo "Product check: HTTP 200, product present -> available=true"
           elif [ "$prod_status" = "404" ]; then
             product_available=false
+            echo "Product check: HTTP 404 -> sold/unpublished, available=false"
           else
-            echo "::warning::Product fetch failed (HTTP $prod_status) — keeping previous state"
+            echo "::warning::Product fetch failed (HTTP $prod_status) -- keeping previous state"
           fi
 
           # --- Collection check ---
@@ -67,11 +68,12 @@ jobs:
 
           if [ "$col_status" = "200" ] && jq -e '.' "$col_tmp" >/dev/null 2>&1; then
             collection_count=$(jq '[.products[]? | select((.title // "" | ascii_downcase) | contains("find n6"))] | length' "$col_tmp")
+            echo "Collection check: found $collection_count Find N6 listing(s)"
           else
-            echo "::warning::Collection fetch failed (HTTP $col_status) — keeping previous count"
+            echo "::warning::Collection fetch failed (HTTP $col_status) -- keeping previous count"
           fi
 
-          # --- Transition detection (notify only on OFF → ON) ---
+          # --- Transition detection (notify only on false -> true) ---
           product_triggered=false
           collection_triggered=false
           [ "$product_available" = "true" ] && [ "$prev_product"    != "true" ] && product_triggered=true
@@ -80,7 +82,7 @@ jobs:
           notify=false
           { [ "$product_triggered" = "true" ] || [ "$collection_triggered" = "true" ]; } && notify=true
 
-          # --- Only commit when meaningful fields change (NOT every run) ---
+          # --- Only commit when meaningful fields change ---
           state_changed=false
           if [ "$product_available" != "$prev_product" ] || [ "$collection_count" != "$prev_collection" ]; then
             state_changed=true
@@ -110,13 +112,13 @@ jobs:
           [ -z "${NTFY_TOPIC:-}" ] && { echo "::warning::NTFY_TOPIC secret not set"; exit 0; }
 
           if [ "${{ steps.check.outputs.product_triggered }}" = "true" ]; then
-            MSG="Product page is IN STOCK — buy now! https://www.themobilemarvel.com/products/oppo-find-n6-global-version-used"
+            MSG="Product page is IN STOCK - buy now! https://www.themobilemarvel.com/products/oppo-find-n6-global-version-used"
           else
-            MSG="New Find N6 listing in used collection (${{ steps.check.outputs.collection_count }} result(s)) — https://www.themobilemarvel.com/collections/used-smartphones"
+            MSG="New Find N6 listing in used collection (${{ steps.check.outputs.collection_count }} result(s)) - https://www.themobilemarvel.com/collections/used-smartphones"
           fi
 
           curl -s \
-            -H "Title: 📱 Find N6 LIVE!" \
+            -H "Title: Find N6 LIVE!" \
             -H "Priority: urgent" \
             -H "Tags: shopping,rotating_light" \
             -d "$MSG" \
