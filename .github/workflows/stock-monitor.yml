@@ -1,0 +1,132 @@
+name: Shopify Stock Monitor
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch: # "Run workflow" button for instant testing
+
+permissions:
+  contents: write
+
+env:
+  STATE_FILE: state.json
+  PRODUCT_URL: https://www.themobilemarvel.com/products/oppo-find-n6-global-version-used.json
+  COLLECTION_URL: https://www.themobilemarvel.com/collections/used-smartphones/products.json?limit=250
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check stock
+        id: check
+        run: |
+          set -euo pipefail
+
+          # Load previous state
+          if [ -f "$STATE_FILE" ] && jq -e '.' "$STATE_FILE" >/dev/null 2>&1; then
+            prev_product=$(jq -r '.product_available // false' "$STATE_FILE")
+            prev_collection=$(jq -r '.collection_count // 0' "$STATE_FILE")
+          else
+            prev_product=false
+            prev_collection=0
+          fi
+
+          fetch() {
+            curl --silent --location --retry 2 --retry-delay 3 \
+                 --max-time 20 --compressed \
+                 -H "User-Agent: Mozilla/5.0 (compatible; stock-monitor/1.0)" \
+                 -H "Accept: application/json" \
+                 -w "%{http_code}" -o "$2" "$1" || echo "000"
+          }
+
+          # --- Product check ---
+          prod_tmp=$(mktemp)
+          prod_status=$(fetch "$PRODUCT_URL" "$prod_tmp")
+          product_available=$prev_product
+
+          if [ "$prod_status" = "200" ] && jq -e '.' "$prod_tmp" >/dev/null 2>&1; then
+            if jq -e '[.product.variants[]? | select(.available == true)] | length > 0' "$prod_tmp" >/dev/null 2>&1; then
+              product_available=true
+            else
+              product_available=false
+            fi
+          elif [ "$prod_status" = "404" ]; then
+            product_available=false
+          else
+            echo "::warning::Product fetch failed (HTTP $prod_status) — keeping previous state"
+          fi
+
+          # --- Collection check ---
+          col_tmp=$(mktemp)
+          col_status=$(fetch "$COLLECTION_URL" "$col_tmp")
+          collection_count=$prev_collection
+
+          if [ "$col_status" = "200" ] && jq -e '.' "$col_tmp" >/dev/null 2>&1; then
+            collection_count=$(jq '[.products[]? | select((.title // "" | ascii_downcase) | contains("find n6"))] | length' "$col_tmp")
+          else
+            echo "::warning::Collection fetch failed (HTTP $col_status) — keeping previous count"
+          fi
+
+          # --- Transition detection (notify only on OFF → ON) ---
+          product_triggered=false
+          collection_triggered=false
+          [ "$product_available" = "true" ] && [ "$prev_product"    != "true" ] && product_triggered=true
+          [ "$collection_count"  -gt 0    ] && [ "$prev_collection" -eq 0    ] && collection_triggered=true
+
+          notify=false
+          { [ "$product_triggered" = "true" ] || [ "$collection_triggered" = "true" ]; } && notify=true
+
+          # --- Only commit when meaningful fields change (NOT every run) ---
+          state_changed=false
+          if [ "$product_available" != "$prev_product" ] || [ "$collection_count" != "$prev_collection" ]; then
+            state_changed=true
+            jq -n \
+              --arg pa "$product_available" \
+              --argjson cc "$collection_count" \
+              --arg ts "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+              '{product_available: ($pa == "true"), collection_count: $cc, last_checked: $ts}' \
+              > "$STATE_FILE"
+          fi
+
+          {
+            echo "product_available=$product_available"
+            echo "collection_count=$collection_count"
+            echo "product_triggered=$product_triggered"
+            echo "collection_triggered=$collection_triggered"
+            echo "state_changed=$state_changed"
+            echo "notify=$notify"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Send ntfy.sh notification
+        if: steps.check.outputs.notify == 'true'
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: |
+          set -euo pipefail
+          [ -z "${NTFY_TOPIC:-}" ] && { echo "::warning::NTFY_TOPIC secret not set"; exit 0; }
+
+          if [ "${{ steps.check.outputs.product_triggered }}" = "true" ]; then
+            MSG="Product page is IN STOCK — buy now! https://www.themobilemarvel.com/products/oppo-find-n6-global-version-used"
+          else
+            MSG="New Find N6 listing in used collection (${{ steps.check.outputs.collection_count }} result(s)) — https://www.themobilemarvel.com/collections/used-smartphones"
+          fi
+
+          curl -s \
+            -H "Title: 📱 Find N6 LIVE!" \
+            -H "Priority: urgent" \
+            -H "Tags: shopping,rotating_light" \
+            -d "$MSG" \
+            "https://ntfy.sh/${NTFY_TOPIC}"
+
+      - name: Commit state change
+        if: steps.check.outputs.state_changed == 'true'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "$STATE_FILE"
+          git diff --cached --quiet || git commit -m "state: product=${{ steps.check.outputs.product_available }} collection=${{ steps.check.outputs.collection_count }}"
+          git push
