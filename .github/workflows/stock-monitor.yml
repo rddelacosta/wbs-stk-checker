@@ -53,11 +53,11 @@ jobs:
           }
 
           # --- Product check ---
-          # This Shopify theme has NO inline JSON (no <script id="product-json">,
-          # no window.Shopify, no embedded product object). Stock state is SSR'd
-          # directly into button text by Liquid. Grep for the button text instead.
-          # In stock:   button renders as "Add to cart"
-          # Sold out:   button renders as "Sold out" (also carries disabled attr)
+          # This Shopify theme has NO inline JSON. Stock state is SSR'd by Liquid
+          # directly into button text. "Sold out" appears when out of stock;
+          # "Add to cart" when available. IMPORTANT: check "Sold out" FIRST —
+          # "Add to cart" can appear in related product widgets lower on the page
+          # even when the main product is sold out.
           prod_tmp=$(mktemp)
           col_tmp=$(mktemp)
           trap 'rm -f "$prod_tmp" "$col_tmp"' EXIT
@@ -66,12 +66,12 @@ jobs:
           product_available=$prev_product
 
           if [ "$prod_status" = "200" ]; then
-            if grep -qi 'add to cart' "$prod_tmp"; then
-              product_available=true
-              echo "Product check: 'Add to cart' button found -> available=true"
-            elif grep -qi 'sold.out' "$prod_tmp"; then
+            if grep -qi 'sold.out' "$prod_tmp"; then
               product_available=false
               echo "Product check: 'Sold out' found -> available=false"
+            elif grep -qi 'add to cart' "$prod_tmp"; then
+              product_available=true
+              echo "Product check: no 'Sold out', 'Add to cart' found -> available=true"
             else
               echo "::warning::Could not determine stock status from page HTML -- keeping previous state"
             fi
