@@ -10,7 +10,7 @@ permissions:
 
 env:
   STATE_FILE: state.json
-  PRODUCT_URL: https://www.themobilemarvel.com/products/oppo-find-n6-global-version-used.json
+  PRODUCT_URL: https://www.themobilemarvel.com/products/oppo-find-n6-global-version-used
   COLLECTION_URL: https://www.themobilemarvel.com/collections/used-smartphones/products.json?limit=250
 
 jobs:
@@ -35,7 +35,17 @@ jobs:
             prev_collection=0
           fi
 
-          fetch() {
+          # Two fetch functions: one for HTML pages, one for JSON APIs
+          fetch_html() {
+            curl --silent --location --retry 2 --retry-delay 3 \
+                 --max-time 20 --compressed \
+                 -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+                 -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" \
+                 -H "Accept-Language: en-GB,en;q=0.9" \
+                 -w "%{http_code}" -o "$2" "$1" || echo "000"
+          }
+
+          fetch_json() {
             curl --silent --location --retry 2 --retry-delay 3 \
                  --max-time 20 --compressed \
                  -H "User-Agent: Mozilla/5.0 (compatible; stock-monitor/1.0)" \
@@ -44,16 +54,30 @@ jobs:
           }
 
           # --- Product check ---
-          # FIX: This store omits `available` from variant JSON.
-          # For a single-unit used listing: HTTP 200 + valid product JSON = in stock.
-          # HTTP 404 = sold/unpublished. Do NOT rely on variants[].available.
+          # Shopify storefront .json omits `available` for this store.
+          # Fetch the HTML page instead -- Shopify embeds full product JSON in
+          # <script id="product-json"> which DOES include available per variant.
           prod_tmp=$(mktemp)
-          prod_status=$(fetch "$PRODUCT_URL" "$prod_tmp")
+          col_tmp=$(mktemp)
+          trap 'rm -f "$prod_tmp" "$col_tmp"' EXIT
+
+          prod_status=$(fetch_html "$PRODUCT_URL" "$prod_tmp")
           product_available=$prev_product
 
-          if [ "$prod_status" = "200" ] && jq -e '.product.id' "$prod_tmp" >/dev/null 2>&1; then
-            product_available=true
-            echo "Product check: HTTP 200, product present -> available=true"
+          if [ "$prod_status" = "200" ]; then
+            product_json=$(sed -n '/<script id="product-json"/,/<\/script>/p' "$prod_tmp" | sed '1d;$d')
+            if [ -n "$product_json" ]; then
+              top_available=$(printf '%s\n' "$product_json" | jq -r '.available // "null"')
+              variant_available=$(printf '%s\n' "$product_json" | jq -r '.variants[]? | select(.id == 47867354579203) | .available // "null"' | head -1)
+              echo "Product check: product.available=$top_available, variant.available=$variant_available"
+              if [ "$top_available" = "true" ] && [ "$variant_available" = "true" ]; then
+                product_available=true
+              else
+                product_available=false
+              fi
+            else
+              echo "::warning::Could not extract <script id=\"product-json\"> -- keeping previous state"
+            fi
           elif [ "$prod_status" = "404" ]; then
             product_available=false
             echo "Product check: HTTP 404 -> sold/unpublished, available=false"
@@ -62,8 +86,7 @@ jobs:
           fi
 
           # --- Collection check ---
-          col_tmp=$(mktemp)
-          col_status=$(fetch "$COLLECTION_URL" "$col_tmp")
+          col_status=$(fetch_json "$COLLECTION_URL" "$col_tmp")
           collection_count=$prev_collection
 
           if [ "$col_status" = "200" ] && jq -e '.' "$col_tmp" >/dev/null 2>&1; then
