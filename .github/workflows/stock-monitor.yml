@@ -35,7 +35,6 @@ jobs:
             prev_collection=0
           fi
 
-          # Two fetch functions: one for HTML pages, one for JSON APIs
           fetch_html() {
             curl --silent --location --retry 2 --retry-delay 3 \
                  --max-time 20 --compressed \
@@ -54,9 +53,11 @@ jobs:
           }
 
           # --- Product check ---
-          # Shopify storefront .json omits `available` for this store.
-          # Fetch the HTML page instead -- Shopify embeds full product JSON in
-          # <script id="product-json"> which DOES include available per variant.
+          # This Shopify theme has NO inline JSON (no <script id="product-json">,
+          # no window.Shopify, no embedded product object). Stock state is SSR'd
+          # directly into button text by Liquid. Grep for the button text instead.
+          # In stock:   button renders as "Add to cart"
+          # Sold out:   button renders as "Sold out" (also carries disabled attr)
           prod_tmp=$(mktemp)
           col_tmp=$(mktemp)
           trap 'rm -f "$prod_tmp" "$col_tmp"' EXIT
@@ -65,22 +66,18 @@ jobs:
           product_available=$prev_product
 
           if [ "$prod_status" = "200" ]; then
-            product_json=$(sed -n '/<script id="product-json"/,/<\/script>/p' "$prod_tmp" | sed '1d;$d')
-            if [ -n "$product_json" ]; then
-              top_available=$(printf '%s\n' "$product_json" | jq -r '.available // "null"')
-              variant_available=$(printf '%s\n' "$product_json" | jq -r '.variants[]? | select(.id == 47867354579203) | .available // "null"' | head -1)
-              echo "Product check: product.available=$top_available, variant.available=$variant_available"
-              if [ "$top_available" = "true" ] && [ "$variant_available" = "true" ]; then
-                product_available=true
-              else
-                product_available=false
-              fi
+            if grep -qi 'add to cart' "$prod_tmp"; then
+              product_available=true
+              echo "Product check: 'Add to cart' button found -> available=true"
+            elif grep -qi 'sold.out' "$prod_tmp"; then
+              product_available=false
+              echo "Product check: 'Sold out' found -> available=false"
             else
-              echo "::warning::Could not extract <script id=\"product-json\"> -- keeping previous state"
+              echo "::warning::Could not determine stock status from page HTML -- keeping previous state"
             fi
           elif [ "$prod_status" = "404" ]; then
             product_available=false
-            echo "Product check: HTTP 404 -> sold/unpublished, available=false"
+            echo "Product check: HTTP 404 -> unpublished, available=false"
           else
             echo "::warning::Product fetch failed (HTTP $prod_status) -- keeping previous state"
           fi
