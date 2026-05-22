@@ -53,11 +53,14 @@ jobs:
           }
 
           # --- Product check ---
-          # This Shopify theme has NO inline JSON. Stock state is SSR'd by Liquid
-          # directly into button text. "Sold out" appears when out of stock;
-          # "Add to cart" when available. IMPORTANT: check "Sold out" FIRST —
-          # "Add to cart" can appear in related product widgets lower on the page
-          # even when the main product is sold out.
+          # Multi-variant page: some variants sold out, others available.
+          # Simple "Sold out" grep fires on variant selector ARIA labels even when
+          # another variant is purchasable. Instead, target the main CTA button
+          # (name="add") specifically:
+          #   - enabled (no disabled attr) = at least one variant available
+          #   - disabled                   = all variants sold out
+          # Perl -0777 slurps the full file so multiline tags and any attribute
+          # ordering are handled correctly. Exits 0 if ANY enabled add button found.
           prod_tmp=$(mktemp)
           col_tmp=$(mktemp)
           trap 'rm -f "$prod_tmp" "$col_tmp"' EXIT
@@ -66,14 +69,12 @@ jobs:
           product_available=$prev_product
 
           if [ "$prod_status" = "200" ]; then
-            if grep -qi 'sold.out' "$prod_tmp"; then
-              product_available=false
-              echo "Product check: 'Sold out' found -> available=false"
-            elif grep -qi 'add to cart' "$prod_tmp"; then
+            if perl -0777 -ne 'while (/<button\b[^>]*name=.add.[^>]*>/ig) { exit 0 if $& !~ /\bdisabled\b/i } exit 1' "$prod_tmp"; then
               product_available=true
-              echo "Product check: no 'Sold out', 'Add to cart' found -> available=true"
+              echo "Product check: enabled add-to-cart button found -> available=true"
             else
-              echo "::warning::Could not determine stock status from page HTML -- keeping previous state"
+              product_available=false
+              echo "Product check: add-to-cart button disabled or absent -> available=false"
             fi
           elif [ "$prod_status" = "404" ]; then
             product_available=false
@@ -132,7 +133,7 @@ jobs:
           [ -z "${NTFY_TOPIC:-}" ] && { echo "::warning::NTFY_TOPIC secret not set"; exit 0; }
 
           if [ "${{ steps.check.outputs.product_triggered }}" = "true" ]; then
-            MSG="Product page is IN STOCK - buy now! https://www.themobilemarvel.com/products/oppo-find-n6-global-version-used"
+            MSG="Find N6 IN STOCK - buy now! https://www.themobilemarvel.com/products/oppo-find-n6-global-version-used"
           else
             MSG="New Find N6 listing in used collection (${{ steps.check.outputs.collection_count }} result(s)) - https://www.themobilemarvel.com/collections/used-smartphones"
           fi
