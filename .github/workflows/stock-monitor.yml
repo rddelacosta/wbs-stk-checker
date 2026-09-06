@@ -2,11 +2,18 @@ name: Shopify Stock Monitor
 
 on:
   schedule:
+    # NOTE: */5 = 288 runs/day. Review cadence before re-enabling the schedule.
     - cron: '*/5 * * * *'
   workflow_dispatch:
 
 permissions:
   contents: write
+
+# Serialise runs so two overlapping checks cannot race on the state push.
+# cancel-in-progress: false — a queued run should wait, not be discarded.
+concurrency:
+  group: stock-monitor
+  cancel-in-progress: false
 
 env:
   STATE_FILE: state.json
@@ -19,21 +26,49 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        # Pinned to the v4 tag commit (2026-07-16). Update deliberately.
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
 
       - name: Check stock
         id: check
         run: |
           set -euo pipefail
 
-          # Load previous state
+          # --- Load previous state (defensively) ---
+          # state.json is writable by anything holding Contents:write, so treat
+          # every field as untrusted input. Values are only ever compared, never
+          # executed, but a non-integer count would silently suppress the
+          # collection trigger (bash prints "integer expression expected" and the
+          # test evaluates false), so coerce it here.
+          prev_product=false
+          prev_collection=0
+
           if [ -f "$STATE_FILE" ] && jq -e '.' "$STATE_FILE" >/dev/null 2>&1; then
-            prev_product=$(jq -r '.product_available // false' "$STATE_FILE")
-            prev_collection=$(jq -r '.collection_count // 0' "$STATE_FILE")
-          else
-            prev_product=false
-            prev_collection=0
+            raw_product=$(jq -r '.product_available // false' "$STATE_FILE")
+            raw_collection=$(jq -r '.collection_count // 0' "$STATE_FILE")
+
+            if [ "$raw_product" = "true" ]; then
+              prev_product=true
+            fi
+
+            if printf '%s' "$raw_collection" | grep -Eq '^[0-9]+$'; then
+              prev_collection=$raw_collection
+            else
+              echo "::warning::state.json collection_count is not a non-negative integer ('$raw_collection') -- defaulting to 0"
+            fi
           fi
+
+          # Normalise curl's -w output. curl already emits 000 on failure, so the
+          # original `|| echo "000"` could produce "000000" and confuse the
+          # comparisons below. Keep the last 3 digits, default to 000.
+          http_code() {
+            local raw="${1:-}"
+            if printf '%s' "$raw" | grep -Eq '[0-9]{3}$'; then
+              printf '%s' "${raw: -3}"
+            else
+              printf '000'
+            fi
+          }
 
           fetch_html() {
             curl --silent --location --retry 2 --retry-delay 3 \
@@ -41,7 +76,7 @@ jobs:
                  -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
                  -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" \
                  -H "Accept-Language: en-GB,en;q=0.9" \
-                 -w "%{http_code}" -o "$2" "$1" || echo "000"
+                 -w "%{http_code}" -o "$2" "$1" || true
           }
 
           fetch_json() {
@@ -49,7 +84,7 @@ jobs:
                  --max-time 20 --compressed \
                  -H "User-Agent: Mozilla/5.0 (compatible; stock-monitor/1.0)" \
                  -H "Accept: application/json" \
-                 -w "%{http_code}" -o "$2" "$1" || echo "000"
+                 -w "%{http_code}" -o "$2" "$1" || true
           }
 
           # --- Product check ---
@@ -65,7 +100,7 @@ jobs:
           col_tmp=$(mktemp)
           trap 'rm -f "$prod_tmp" "$col_tmp"' EXIT
 
-          prod_status=$(fetch_html "$PRODUCT_URL" "$prod_tmp")
+          prod_status=$(http_code "$(fetch_html "$PRODUCT_URL" "$prod_tmp")")
           product_available=$prev_product
 
           if [ "$prod_status" = "200" ]; then
@@ -84,7 +119,7 @@ jobs:
           fi
 
           # --- Collection check ---
-          col_status=$(fetch_json "$COLLECTION_URL" "$col_tmp")
+          col_status=$(http_code "$(fetch_json "$COLLECTION_URL" "$col_tmp")")
           collection_count=$prev_collection
 
           if [ "$col_status" = "200" ] && jq -e '.' "$col_tmp" >/dev/null 2>&1; then
@@ -95,6 +130,9 @@ jobs:
           fi
 
           # --- Transition detection (notify only on false -> true) ---
+          # KNOWN BLIND SPOT (intended): collection_count only fires on 0 -> >0.
+          # A restock of the SAME listing keeps the count at 1 throughout, so only
+          # the product-page button check catches it.
           product_triggered=false
           collection_triggered=false
           [ "$product_available" = "true" ] && [ "$prev_product"    != "true" ] && product_triggered=true
@@ -128,14 +166,16 @@ jobs:
         if: steps.check.outputs.notify == 'true'
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          PRODUCT_TRIGGERED: ${{ steps.check.outputs.product_triggered }}
+          COLLECTION_COUNT: ${{ steps.check.outputs.collection_count }}
         run: |
           set -euo pipefail
           [ -z "${NTFY_TOPIC:-}" ] && { echo "::warning::NTFY_TOPIC secret not set"; exit 0; }
 
-          if [ "${{ steps.check.outputs.product_triggered }}" = "true" ]; then
+          if [ "$PRODUCT_TRIGGERED" = "true" ]; then
             MSG="Find N6 IN STOCK - buy now! https://www.themobilemarvel.com/products/oppo-find-n6-global-version-used"
           else
-            MSG="New Find N6 listing in used collection (${{ steps.check.outputs.collection_count }} result(s)) - https://www.themobilemarvel.com/collections/used-smartphones"
+            MSG="New Find N6 listing in used collection (${COLLECTION_COUNT} result(s)) - https://www.themobilemarvel.com/collections/used-smartphones"
           fi
 
           curl -s \
@@ -147,9 +187,38 @@ jobs:
 
       - name: Commit state change
         if: steps.check.outputs.state_changed == 'true'
+        env:
+          PRODUCT_AVAILABLE: ${{ steps.check.outputs.product_available }}
+          COLLECTION_COUNT: ${{ steps.check.outputs.collection_count }}
         run: |
+          set -euo pipefail
+
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add "$STATE_FILE"
-          git diff --cached --quiet || git commit -m "state: product=${{ steps.check.outputs.product_available }} collection=${{ steps.check.outputs.collection_count }}"
-          git push
+
+          if git diff --cached --quiet; then
+            echo "Nothing staged -- skipping commit."
+            exit 0
+          fi
+
+          git commit -m "state: product=${PRODUCT_AVAILABLE} collection=${COLLECTION_COUNT}"
+
+          # The bare `git push` had no rebase guard: a concurrent run (or any other
+          # commit landing on main) causes a non-fast-forward rejection and the run
+          # fails with the state change lost. Retry with rebase.
+          pushed=false
+          for attempt in 1 2 3 4 5; do
+            if git push; then
+              pushed=true
+              break
+            fi
+            echo "Push attempt $attempt failed -- rebasing and retrying."
+            sleep $(( attempt * 3 ))
+            git pull --rebase --autostash
+          done
+
+          if [ "$pushed" != "true" ]; then
+            echo "::error::Failed to push state after 5 attempts."
+            exit 1
+          fi
