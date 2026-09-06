@@ -3,7 +3,7 @@ name: Shopify Stock Monitor
 on:
   schedule:
     # NOTE: */5 = 288 runs/day. Review cadence before re-enabling the schedule.
-    - cron: '*/5 * * * *'
+    - cron: '*/30 * * * *'
   workflow_dispatch:
 
 permissions:
