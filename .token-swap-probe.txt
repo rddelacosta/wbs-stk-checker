@@ -1,0 +1,1 @@
+Scratch write verifying the gh-mcp-bridge fine-grained PAT reaches this repo. Removed immediately.
